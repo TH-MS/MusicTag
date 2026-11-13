@@ -1,1 +1,33 @@
-<!doctype html><title>MusicTag</title>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MusicTag</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header id="bar">
+  <div class="brand">MusicTag <span id="stats"></span></div>
+  <div class="actions">
+    <button id="btn-add" class="ghost" title="Add files">Add</button>
+    <button id="btn-clear" class="ghost" title="Remove all from the list">Clear</button>
+    <button id="btn-save" class="primary" disabled title="Save changes (Ctrl+S)">Save</button>
+  </div>
+</header>
+<main id="main">
+  <div id="empty">
+    <div class="drop-target">
+      <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+      <p>Drop music files or folders here</p>
+      <span>or click to browse</span>
+    </div>
+  </div>
+  <div id="albums"></div>
+</main>
+<div id="drag-overlay"><span>Drop to add</span></div>
+<div id="menu" hidden></div>
+<div id="toast" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>

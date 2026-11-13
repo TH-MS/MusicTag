@@ -266,9 +266,9 @@ fn write_track(edit: &TrackEdit, covers: &HashMap<String, Option<Picture>>) -> R
         }
     }
 
-    // ID3v2.3 is what MP3Tag/iTunes/Windows write by default; widest compatibility.
+    // ID3v2.4: v2.3 cannot hold Sort Album (TSOA) or full dates (TDRC), so keep the default.
     tagged
-        .save_to_path(path, WriteOptions::default().use_id3v23(true))
+        .save_to_path(path, WriteOptions::default())
         .map_err(es)
 }
 
