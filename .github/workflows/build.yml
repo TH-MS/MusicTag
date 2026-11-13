@@ -1,0 +1,53 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test-core:
+    name: Tag engine tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p musictag-core --no-fail-fast
+
+  build-windows:
+    name: Portable Windows exe
+    needs: test-core
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: npm install
+      - run: npx tauri build --no-bundle
+      - name: Collect exe
+        shell: bash
+        run: |
+          mkdir dist
+          cp target/release/musictag.exe dist/MusicTag.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MusicTag-portable
+          path: dist/MusicTag.exe
+      - name: Publish rolling "latest" release
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest dist/MusicTag.exe \
+            --title "MusicTag (latest build)" \
+            --notes "Portable Windows 11 build of commit ${GITHUB_SHA::7}. Download MusicTag.exe and run it - no install needed."

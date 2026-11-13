@@ -1,0 +1,10 @@
+[package]
+name = "musictag-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lofty = "0.22"
+serde = { version = "1", features = ["derive"] }
+base64 = "0.22"
+rayon = "1"
