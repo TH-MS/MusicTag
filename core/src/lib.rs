@@ -240,16 +240,9 @@ fn write_track(edit: &TrackEdit, covers: &HashMap<String, Option<Picture>>) -> R
             "disc" => set_text(tag, ItemKey::DiscNumber, v),
             "disc_total" => set_text(tag, ItemKey::DiscTotal, v),
             "year" => {
-                let y = v.trim();
+                // ID3v2.4 has no TYER; RecordingDate (TDRC / DATE / ©day) holds year or full date.
                 tag.remove_key(&ItemKey::Year);
-                tag.remove_key(&ItemKey::RecordingDate);
-                if !y.is_empty() {
-                    if y.len() == 4 && y.chars().all(|c| c.is_ascii_digit()) {
-                        tag.insert_text(ItemKey::Year, y.to_string());
-                    } else {
-                        tag.insert_text(ItemKey::RecordingDate, y.to_string());
-                    }
-                }
+                set_text(tag, ItemKey::RecordingDate, v);
             }
             _ => {}
         }
