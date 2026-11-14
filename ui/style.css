@@ -1,6 +1,6 @@
 /* Light, high-contrast theme: clear outlines, banded rows, strong text. */
 :root {
-  --page: #d5dbe5;
+  --page: #dbd9d4;       /* warm neutral grey, no blue tint */
   --panel: #ffffff;
   --ink: #0c0f14;
   --muted: #4b5565;
@@ -57,6 +57,7 @@ body.dragging #drag-overlay { display: flex; }
 .card-head { display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 4px 10px 4px 6px; background: var(--head); border-bottom: 2px solid var(--line); cursor: default; }
 .card.collapsed { contain-intrinsic-size: auto 44px; }
 .card.collapsed .card-head { border-bottom: 0; }
+.card.collapsed + .card.collapsed { margin-top: -7px; }   /* 33% tighter than the 22px gap */
 .chev { width: 26px; height: 26px; border-radius: 4px; font-size: 12px; flex: none; }
 .chev:hover { background: var(--hover); }
 .thumb { width: 32px; height: 32px; flex: none; display: none; background: #fff; border: 1px solid var(--line); overflow: hidden; }
@@ -74,6 +75,7 @@ body.dragging #drag-overlay { display: flex; }
 .card.collapsed .main { display: none; }
 .side { display: flex; flex-direction: column; gap: 6px; }
 .cover { width: 176px; min-height: 176px; background: #eef1f6; border: 1px solid var(--line); display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 28px; border-radius: 0; }
+.cover { cursor: pointer; }
 .cover img { width: 100%; height: auto; display: block; border-radius: 0; }  /* exact image, no crop, no rounding */
 .cover-meta { font-size: 12px; color: var(--muted); text-align: center; min-height: 15px; margin-bottom: 4px; }
 .cover-meta .warn { color: #a85d00; font-weight: 600; }

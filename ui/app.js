@@ -50,15 +50,15 @@ function saveCols() {
 /* ───────────────────────── state ───────────────────────── */
 const PREFS_KEY = 'musictag.prefs.v1';
 function loadPrefs() {
-  const d = { albumSort: { by: 'artist', dir: 1, within: 'year' }, dest: { root: '', move: true } };
+  const d = { albumSort: { by: 'artist', dir: 1, within: 'year' }, dest: { root: '', move: true }, global: true };
   try {
     const p = JSON.parse(localStorage.getItem(PREFS_KEY) || 'null');
-    if (p) return { albumSort: { ...d.albumSort, ...p.albumSort }, dest: { ...d.dest, ...p.dest } };
+    if (p) return { albumSort: { ...d.albumSort, ...p.albumSort }, dest: { ...d.dest, ...p.dest }, global: p.global !== false };
   } catch (_) { /* ignore */ }
   return d;
 }
 function savePrefs() {
-  try { localStorage.setItem(PREFS_KEY, JSON.stringify({ albumSort: S.albumSort, dest: S.dest })); } catch (_) { /* ignore */ }
+  try { localStorage.setItem(PREFS_KEY, JSON.stringify({ albumSort: S.albumSort, dest: S.dest, global: S.global })); } catch (_) { /* ignore */ }
 }
 const prefs0 = loadPrefs();
 const S = {
@@ -70,6 +70,10 @@ const S = {
   albumSort: prefs0.albumSort,        // order of the albums themselves
   dest: prefs0.dest,                  // where saved files are filed
   collapsed: new Set(),
+  global: prefs0.global,              // column layout shared by every album?
+  layouts: new Map(),                 // per-album layouts (when global is off)
+  lastEdited: null,                   // album whose layout was adjusted most recently
+  clip: null,                         // cut/copied cover
   sel: new Set(),                     // selected track paths
   cursor: null,
   armed: false,
@@ -95,7 +99,7 @@ function h(tag, props = {}, ...kids) {
 const comb = (n, t) => (t ? `${n}/${t}` : n || '');
 function mkTrack(i) {
   return {
-    path: i.path, ed: {}, coverFrom: null,
+    path: i.path, ed: {}, coverFrom: null, staged: undefined,
     base: {
       filename: i.filename, kind: i.kind, path: i.path,
       title: i.title, artist: i.artist, album: i.album, album_artist: i.album_artist,
@@ -110,9 +114,11 @@ function setVal(t, f, v) {
   v = String(v ?? '').trim();
   if (v === t.base[f]) delete t.ed[f]; else t.ed[f] = v;
 }
-const isDirty = t => Object.keys(t.ed).length > 0 || !!t.coverFrom;
+const isDirty = t => Object.keys(t.ed).length > 0 || !!t.coverFrom || t.staged !== undefined;
 const keyOf = t => val(t, 'album').trim();
 function cov(t) {
+  if (t.staged === 'remove') return null;
+  if (t.staged) return t.staged.info;
   if (t.coverFrom) { const s = S.tracks.get(t.coverFrom); return s ? s.base.cover : null; }
   return t.base.cover;
 }
@@ -199,13 +205,17 @@ function bestCoverTrack(list) {
 }
 function updateCover(card, list) {
   const best = bestCoverTrack(list);
+  const st = best && best.staged && best.staged !== 'remove' ? best.staged : null;
   const srcPath = best ? (best.coverFrom || best.path) : null;
+  const ck = st ? `staged:${st.info.bytes}:${st.url.length}` : srcPath;
   const box = $('.cover', card), thumb = $('.thumb', card), meta = $('.cover-meta', card);
-  if (card._cover !== srcPath) {
-    card._cover = srcPath;
-    box.replaceChildren(srcPath ? '' : '♪'); thumb.replaceChildren();
-    if (srcPath) coverUrl(srcPath).then(u => {
-      if (card._cover !== srcPath) return;
+  if (card._cover !== ck) {
+    card._cover = ck;
+    box.replaceChildren(ck ? '' : '♪'); thumb.replaceChildren();
+    card._coverP = ck ? (st ? Promise.resolve(st.url) : coverUrl(srcPath)) : Promise.resolve(null);
+    const mine = card._coverP;
+    mine.then(u => {
+      if (card._coverP !== mine || !ck) return;
       box.replaceChildren(u ? h('img', { src: u, draggable: 'false' }) : '♪');
       if (u) thumb.replaceChildren(h('img', { src: u, draggable: 'false' }));
     });
@@ -221,12 +231,28 @@ function updateCover(card, list) {
 /* ───────────────────────── rendering ───────────────────────── */
 const FIELDS = [
   ['album', 'Album'], ['album_artist', 'Album Artist'], ['artist', 'Artist'],
-  ['year', 'Year'], ['genre', 'Genre'], ['sort_album', 'Sort Album'],
+  ['year', 'Year'], ['sort_album', 'Sort Album'], ['genre', 'Genre'],
 ];
-const visible = () => S.cols.order.filter(id => !S.cols.hidden.includes(id));
-const colW = id => S.cols.widths[id] || COL[id].w;
-function applyTemplate() {
-  albumsEl.style.setProperty('--cols', visible().map(id => `${colW(id)}px`).join(' '));
+// Column layout: one shared layout, or one per album when "Global adjustment" is off.
+const lay = key => {
+  if (S.global) return S.cols;
+  if (!S.layouts.has(key)) S.layouts.set(key, structuredClone(S.cols));
+  return S.layouts.get(key);
+};
+const visible = L => L.order.filter(id => !L.hidden.includes(id));
+const colW = (L, id) => L.widths[id] || COL[id].w;
+const tpl = L => visible(L).map(id => `${colW(L, id)}px`).join(' ');
+function applyTemplate(key) {
+  const set = (card, k) => card.style.setProperty('--cols', tpl(lay(k)));
+  if (key === undefined || S.global) S.cards.forEach((c, k) => set(c, k));
+  else if (S.cards.get(key)) set(S.cards.get(key), key);
+}
+// Call after any layout change made in album `key`.
+function layoutChanged(key, rerender) {
+  S.lastEdited = key;
+  if (S.global) saveCols();
+  const cards = S.global ? [...S.cards.values()] : [S.cards.get(key)];
+  if (rerender) cards.forEach(c => c && updateCard(c)); else applyTemplate(key);
 }
 
 function buildCard(key) {
@@ -249,7 +275,7 @@ function buildCard(key) {
       h('button', { class: 'close', text: '×', title: 'Remove album from list', on: { click: () => removeAlbum(key) } })),
     h('div', { class: 'main' },
       h('div', { class: 'side' },
-        h('div', { class: 'cover' }),
+        h('div', { class: 'cover', title: 'Click for cover options', on: { click: e => coverMenu(key, e.clientX, e.clientY) } }),
         h('div', { class: 'cover-meta' }),
         h('button', { class: 'auto', text: 'Auto', title: 'Fill album artist, unify cover art, tidy track/disc numbers and sort album', on: { click: () => autoAlbum(key) } }),
         h('button', { class: 'selall', text: 'Select All', title: 'Select every track in this album', on: { click: () => selectAll(key) } }),
@@ -266,7 +292,9 @@ function updateCard(card) {
   const list = S.groups.get(card._key) || [];
   const tbl = $('.tbl', card);
   const left = tbl.scrollLeft;
-  tbl.replaceChildren(buildHeader(), ...sortRows(list).map(buildRow));
+  const L = lay(card._key);
+  card.style.setProperty('--cols', tpl(L));
+  tbl.replaceChildren(buildHeader(L), ...sortRows(list).map(t => buildRow(t, L)));
   tbl.scrollLeft = left;
   syncFields(card);
   updateCover(card, list);
@@ -314,8 +342,9 @@ const san = s => {
 function albumCtx(list) {
   const rows = list.map(t => pair(val(t, 'disc')));
   const discs = Math.max(1, ...rows.map(r => r.n || 1), ...rows.map(r => r.t || 0));
-  const maxTrack = Math.max(0, ...list.map(t => pair(val(t, 'track')).n || 0));
-  return { multi: discs > 1, tw: Math.max(2, String(maxTrack).length) };
+  const tr = list.map(t => pair(val(t, 'track')));
+  const maxTrack = Math.max(0, ...tr.map(r => r.n || 0), ...tr.map(r => r.t || 0));
+  return { multi: discs > 1, tw: Math.max(2, String(maxTrack).length), dw: Math.max(2, String(discs).length) };
 }
 function targetParts(t, ctx) {
   const artist = val(t, 'album_artist').trim() || val(t, 'artist').trim() || 'Unknown Artist';
@@ -335,9 +364,9 @@ function needsSave(t, ctx) {
   return want !== have;
 }
 
-function buildHeader() {
+function buildHeader(L) {
   const row = h('div', { class: 'tr th' });
-  for (const id of visible()) {
+  for (const id of visible(L)) {
     const sorted = S.sort.id === id;
     row.append(h('div', { class: 'h' + (sorted ? ' sorted' : ''), data: { id } },
       COL[id].label,
@@ -347,9 +376,9 @@ function buildHeader() {
   return row;
 }
 
-function buildRow(t) {
+function buildRow(t, L) {
   const row = h('div', { class: 'tr row' + (S.sel.has(t.path) ? ' sel' : ''), data: { path: t.path } });
-  for (const id of visible()) {
+  for (const id of visible(L)) {
     const c = COL[id];
     row.append(h('div', {
       class: 'td' + (c.num ? ' num' : '') + (c.ro ? ' ro' : '') + (id in t.ed ? ' dirty' : ''),
@@ -363,7 +392,6 @@ function renderAll() {
   regroup();
   albumsEl.replaceChildren();
   S.cards.clear();
-  applyTemplate();
   for (const key of sortedKeys()) {
     const card = buildCard(key);
     S.cards.set(key, card);
@@ -463,13 +491,24 @@ function startEdit(td) {
     if (done) return; done = true;
     let nextId = null;
     if (dir) {
-      const cols = visible().filter(c => !COL[c].ro);
+      const cols = visible(lay(row.closest('.card')._key)).filter(c => !COL[c].ro);
       nextId = cols[cols.indexOf(id) + dir] ?? null;
     }
     if (commit) {
       const v = input.value.trim();
       const ok = (id !== 'track' && id !== 'disc') || /^\d*(\s*\/\s*\d*)?$/.test(v);
-      if (ok) mutate([t], () => setVal(t, id, v.replace(/\s+/g, '')));
+      if (ok) {
+        let out = v.replace(/\s+/g, '');
+        if ((id === 'track' || id === 'disc') && out) {
+          // Always keep leading zeros: 01–09 (001–099 for 100+ track albums).
+          const p = pair(out), old = pair(val(t, id));
+          const ctx = albumCtx(S.groups.get(keyOf(t)) || [t]);
+          const tot = p.t ?? old.t;
+          const w = Math.max(id === 'track' ? ctx.tw : ctx.dw, String(p.n || 0).length, String(tot || 0).length);
+          if (p.n != null) out = padN(p.n, w) + (tot ? `/${padN(tot, w)}` : '');
+        }
+        mutate([t], () => setVal(t, id, out));
+      }
       else { toast('Use a number, or number/total'); mutate([t], () => {}); }
     } else mutate([t], () => {});
     if (nextId) {
@@ -490,13 +529,62 @@ function removeAlbum(key) {
   refresh(new Set([key]));
 }
 
+/* ───────────────────────── cover menu ───────────────────────── */
+function setCover(key, staged) {
+  const list = S.groups.get(key) || [];
+  mutate(list, () => list.forEach(t => {
+    if (staged === 'remove' && !cov(t)) return;
+    t.staged = staged; t.coverFrom = null;
+  }));
+}
+async function coverMenu(key, x, y) {
+  const list = S.groups.get(key) || [];
+  const has = !!bestCoverTrack(list);
+  showMenu([
+    { label: 'Add cover…', fn: async () => {
+      try {
+        const f = await TAURI.dialog.open({ multiple: false, filters: [{ name: 'Images', extensions: ['jpg', 'jpeg', 'png', 'gif', 'bmp'] }] });
+        if (!f) return;
+        const img = await invoke('load_image', { path: Array.isArray(f) ? f[0] : f });
+        setCover(key, { url: img.url, info: img.info });
+      } catch (e) { toast(`Could not add cover: ${e}`); }
+    } },
+    { label: 'Remove cover', off: !has, fn: () => setCover(key, 'remove') },
+    { label: 'Extract cover…', off: !has, fn: async () => {
+      const url = await S.cards.get(key)._coverP;
+      if (!url) return;
+      const ext = /^data:image\/(png|gif|bmp)/.exec(url)?.[1] || 'jpg';
+      try {
+        const dest = await TAURI.dialog.save({ defaultPath: `${san(key || 'cover')}.${ext}`, filters: [{ name: 'Image', extensions: [ext] }] });
+        if (dest) { await invoke('save_image', { dest, url }); toast('Cover saved'); }
+      } catch (e) { toast(`Could not save cover: ${e}`); }
+    } },
+    { rule: true },
+    { label: 'Cut cover', off: !has, fn: async () => { await copyCover(key); setCover(key, 'remove'); } },
+    { label: 'Copy cover', off: !has, fn: () => copyCover(key) },
+    { label: 'Paste cover', off: !S.clip, fn: () => setCover(key, { url: S.clip.url, info: S.clip.info }) },
+  ], x, y);
+}
+async function copyCover(key) {
+  const best = bestCoverTrack(S.groups.get(key) || []);
+  const url = await S.cards.get(key)._coverP;
+  if (best && url) S.clip = { url, info: cov(best) };
+}
+
 /* ───────────────────────── Auto ───────────────────────── */
 const padN = (n, w) => String(n).padStart(w, '0');
 function autoAlbum(key) {
   const list = S.groups.get(key) || [];
-  const snap = () => list.map(t => JSON.stringify([t.ed, t.coverFrom]));
+  const snap = () => list.map(t => JSON.stringify([t.ed, t.coverFrom, t.staged ? (t.staged === 'remove' ? 'r' : t.staged.info.bytes) : 0]));
   const before = snap();
   mutate(list, () => {
+    // 0. Year: keep only the year (01-05-1999 / 1999-05-01 / 19990501 → 1999).
+    list.forEach(t => {
+      const y = val(t, 'year').trim();
+      const m = /^(\d{4})\d{4}$/.exec(y) || /(?:^|\D)(\d{4})(?:\D|$)/.exec(y);
+      if (m && m[1] !== y) setVal(t, 'year', m[1]);
+    });
+
     // 1. Album artist: one track has it → every track gets it.
     const counts = new Map();
     list.forEach(t => { const v = val(t, 'album_artist').trim(); if (v) counts.set(v, (counts.get(v) || 0) + 1); });
@@ -508,8 +596,11 @@ function autoAlbum(key) {
     // 2. Cover: largest embedded image wins, copied to every lower-resolution (or missing) one.
     const best = bestCoverTrack(list);
     if (best) {
-      const bp = pixels(cov(best)), src = best.coverFrom || best.path;
-      list.forEach(t => { if (t.path !== src && pixels(cov(t)) < bp) t.coverFrom = src; });
+      const bp = pixels(cov(best)), src = best.coverFrom || best.path, bs = best.staged && best.staged !== 'remove';
+      list.forEach(t => {
+        if (t === best || pixels(cov(t)) >= bp || (!bs && t.path === src)) return;
+        if (bs) { t.staged = best.staged; t.coverFrom = null; } else { t.staged = undefined; t.coverFrom = src; }
+      });
     }
 
     // 3. Track numbers: 01, 02 … and "of" = highest track number on that disc.
@@ -554,7 +645,7 @@ async function addPaths(paths) {
 
 async function chooseRoot() {
   try {
-    const d = await TAURI.dialog.open({ directory: true, multiple: false, title: 'Choose the folder to file music into' });
+    const d = await TAURI.dialog.open({ directory: true, multiple: false, title: 'Select default folder location' });
     if (d) { S.dest.root = Array.isArray(d) ? d[0] : d; savePrefs(); chrome(); return S.dest.root; }
   } catch (e) { toast(`Could not open dialog: ${e}`); }
   return '';
@@ -577,7 +668,8 @@ async function saveTracks(scope) {
     ['title', 'artist', 'album', 'album_artist', 'genre', 'sort_album', 'comment', 'composer', 'year']
       .forEach(f => { fields[f] = val(t, f); });
     const move = S.dest.move && S.dest.root;
-    return { path: t.path, fields, cover_from: t.coverFrom,
+    const st = t.staged && t.staged !== 'remove' ? t.staged.url : null;
+    return { path: t.path, fields, cover_from: t.staged ? null : t.coverFrom, cover_data: st, remove_cover: t.staged === 'remove',
       dest_root: move ? S.dest.root : null, dest_parts: move ? targetParts(t, ctxOf(t)) : null };
   });
   let results;
@@ -596,7 +688,7 @@ async function saveTracks(scope) {
         if (S.sel.delete(r.path)) S.sel.add(fresh.path);
         t.base = fresh.base; t.path = fresh.path;
       }
-      t.ed = {}; t.coverFrom = null;
+      t.ed = {}; t.coverFrom = null; t.staged = undefined;
       S.tracks.set(t.path, t);
       keys.add(keyOf(t));
     } else failed.push(`${t.base.filename}: ${r.error}`);
@@ -652,13 +744,14 @@ function showMenu(items, x, y) {
 function closeMenu() { menu.hidden = true; }
 function menuAt(btn) { const r = btn.getBoundingClientRect(); return [r.left, r.bottom + 4]; }
 
-function columnMenu(x, y) {
+function columnMenu(x, y, key) {
+  const L = lay(key);
   showMenu([...COLS].sort((a, b) => a.label.localeCompare(b.label)).map(c => {
-    const on = !S.cols.hidden.includes(c.id);
+    const on = !L.hidden.includes(c.id);
     return { label: c.label, tick: on, fn: () => {
-      if (on && visible().length === 1) return;
-      S.cols.hidden = on ? [...S.cols.hidden, c.id] : S.cols.hidden.filter(i => i !== c.id);
-      saveCols(); renderAll();
+      if (on && visible(L).length === 1) return;
+      L.hidden = on ? [...L.hidden, c.id] : L.hidden.filter(i => i !== c.id);
+      layoutChanged(key, true);
     } };
   }), x, y);
 }
@@ -686,10 +779,29 @@ function syncSortLabel() {
   $('#btn-sort').textContent = `Sort: ${{ artist: 'Artist', title: 'Title', year: 'Year' }[a.by]} ${a.dir > 0 ? '↑' : '↓'} ▾`;
 }
 
+function toggleGlobal() {
+  if (S.global) { S.global = false; S.layouts.clear(); }            // albums start from the shared layout
+  else {
+    S.global = true;                                                // adopt the most recently adjusted album's layout
+    const src = S.layouts.get(S.lastEdited);
+    if (src) { S.cols = structuredClone(src); saveCols(); }
+    S.layouts.clear();
+  }
+  savePrefs();
+  S.cards.forEach(updateCard);
+}
+function settingsMenu() {
+  showMenu([
+    { label: `Global adjustment: ${S.global ? 'On' : 'Off'}`, tick: S.global, fn: toggleGlobal },
+    { label: S.global ? 'Column widths and headers apply to every album' : 'Column widths and headers apply only to the album you adjust', off: true },
+    ...(S.global ? [] : [{ label: 'Turning it on copies the last adjusted album\'s layout to all', off: true }]),
+  ], ...menuAt($('#btn-settings')));
+}
+
 function destMenu() {
   showMenu([
     { label: S.dest.root ? S.dest.root : 'No folder chosen yet', off: true },
-    { label: 'Choose folder…', fn: async () => { await chooseRoot(); } },
+    { label: 'Select default folder location…', fn: async () => { await chooseRoot(); } },
     { rule: true },
     { label: 'File into Artist \\ Album \\ 01 - Title on save', tick: S.dest.move, fn: () => { S.dest.move = !S.dest.move; savePrefs(); chrome(); } },
     { label: 'Multi-disc albums: 1-01 - Title', off: true },
@@ -697,22 +809,23 @@ function destMenu() {
 }
 
 /* ───────────────────────── header interactions ───────────────────────── */
-function autosize(id) {
+function autosize(id, key) {
+  const L = lay(key);
   let max = COL[id].label.length + 3;
-  for (const t of S.tracks.values()) max = Math.max(max, cellText(t, id).length);
-  S.cols.widths[id] = Math.max(44, Math.min(520, Math.round(max * 7 + 22)));
-  saveCols(); applyTemplate();
+  for (const t of (S.groups.get(key) || [])) max = Math.max(max, cellText(t, id).length);
+  L.widths[id] = Math.max(44, Math.min(520, Math.round(max * 7 + 22)));
+  layoutChanged(key, false);
 }
 
 albumsEl.addEventListener('mousedown', e => {
   const hd = e.target.closest('.th .h');
   if (e.button !== 0 || !hd) return;
-  const id = hd.dataset.id;
+  const id = hd.dataset.id, key = hd.closest('.card')._key, L = lay(key);
   if (e.target.classList.contains('grip')) {            // resize
     e.preventDefault();
-    const x0 = e.clientX, w0 = colW(id);
-    const move = ev => { S.cols.widths[id] = Math.max(40, w0 + ev.clientX - x0); applyTemplate(); };
-    const up = () => { removeEventListener('mousemove', move); removeEventListener('mouseup', up); saveCols(); };
+    const x0 = e.clientX, w0 = colW(L, id);
+    const move = ev => { L.widths[id] = Math.max(40, w0 + ev.clientX - x0); layoutChanged(key, false); };
+    const up = () => { removeEventListener('mousemove', move); removeEventListener('mouseup', up); };
     addEventListener('mousemove', move); addEventListener('mouseup', up);
     return;
   }
@@ -739,10 +852,10 @@ albumsEl.addEventListener('mousedown', e => {
       S.sort = S.sort.id === id ? { id, dir: -S.sort.dir } : { id, dir: 1 };
       S.cards.forEach(updateCard);
     } else if (target) {
-      const order = S.cols.order.filter(i => i !== id);
+      const order = L.order.filter(i => i !== id);
       const at = order.indexOf(target) + (side === 'after' ? 1 : 0);
       order.splice(at, 0, id);
-      S.cols.order = order; saveCols(); renderAll();
+      L.order = order; layoutChanged(key, true);
     }
   };
   addEventListener('mousemove', move); addEventListener('mouseup', up);
@@ -750,7 +863,7 @@ albumsEl.addEventListener('mousedown', e => {
 
 albumsEl.addEventListener('dblclick', e => {
   const grip = e.target.closest('.grip');
-  if (grip) { autosize(grip.closest('.h').dataset.id); return; }
+  if (grip) { autosize(grip.closest('.h').dataset.id, grip.closest('.card')._key); return; }
   const td = e.target.closest('.row .td');
   if (td && !td.querySelector('input')) startEdit(td);
 });
@@ -767,7 +880,7 @@ albumsEl.addEventListener('click', e => {
   selectionChanged();
 });
 albumsEl.addEventListener('contextmenu', e => {
-  if (e.target.closest('.th')) { e.preventDefault(); columnMenu(e.clientX, e.clientY); }
+  if (e.target.closest('.th')) { e.preventDefault(); columnMenu(e.clientX, e.clientY, e.target.closest('.card')._key); }
 });
 addEventListener('mousedown', e => { if (!menu.hidden && !menu.contains(e.target)) closeMenu(); });
 addEventListener('keydown', e => {
@@ -783,6 +896,7 @@ $('#btn-save').addEventListener('click', saveAll);
 $('#btn-fold').addEventListener('click', foldAll);
 $('#btn-sort').addEventListener('click', e => { e.stopPropagation(); sortMenu(); });
 $('#btn-dest').addEventListener('click', e => { e.stopPropagation(); destMenu(); });
+$('#btn-settings').addEventListener('click', e => { e.stopPropagation(); settingsMenu(); });
 syncSortLabel();
 $('.drop-target').addEventListener('click', browse);
 

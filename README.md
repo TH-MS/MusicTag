@@ -2,7 +2,7 @@
 
 A small, portable Windows 11 music tagger. Drop files in, edit per album, press **Auto**.
 
-**Download:** [`MusicTag.exe` (latest build)](https://github.com/TH-MS/MusicTag/releases/tag/latest) – single file, no install.
+**Download:** [`MusicTag-vX.Y.Z.exe` (latest build; the number is the build version)](https://github.com/TH-MS/MusicTag/releases/tag/latest) – single file, no install.
 (Unsigned, so Windows SmartScreen may warn once: *More info → Run anyway*.)
 
 ## Use
@@ -23,6 +23,10 @@ A small, portable Windows 11 music tagger. Drop files in, edit per album, press 
   `Root\Album Artist\Album\NN - Title.ext`, or `Root\Album Artist\Album\D-NN - Title.ext` when the album has more than one disc
   (same as the MP3Tag rule `%albumartist%\%album%\$ifgreater(%totaldiscs%,1,%discnumber%-,)$num(%track%,2) - %title%`).
   Characters Windows forbids become `_`; an existing file is never overwritten (` (1)` is appended).
+- **Cover art:** click the cover for Add / Remove / Extract / Cut / Copy / Paste (applies to the whole album). There is deliberately no "Adjust cover": re-encoding images would need an image library and bloat the app.
+- **Settings:** *Global adjustment* on = column widths/order/headers are shared by all albums; off = each album keeps its own. Turning it back on copies the most recently adjusted album's layout to the rest.
+- **Clean tags:** saving writes one value per field (ID3v2.4), removes legacy duplicate date frames (TYER/TDAT/TIME) and any stale ID3v1 block, and leaves other frames (ratings, etc.) alone.
+- Typing a track/disc number without a leading zero is padded automatically (`3` → `03`, `003` for 100+ track albums); filenames always use the padded form.
 - Changes are staged (highlighted). **Save** writes them; **Clear** discards.
 
 ## Build
