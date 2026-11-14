@@ -24,10 +24,32 @@ async fn get_cover(path: String) -> Result<Option<String>, String> {
         .map_err(|e| e.to_string())
 }
 
+#[derive(serde::Serialize)]
+struct ImageData {
+    url: String,
+    info: musictag_core::CoverInfo,
+}
+
+#[tauri::command]
+async fn load_image(path: String) -> Result<ImageData, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        musictag_core::image_from_file(&path).map(|(url, info)| ImageData { url, info })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn save_image(dest: String, url: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || musictag_core::write_data_url(&dest, &url))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![load_paths, save_tracks, get_cover])
+        .invoke_handler(tauri::generate_handler![load_paths, save_tracks, get_cover, load_image, save_image])
         .on_window_event(|window, event| {
             if let WindowEvent::DragDrop(d) = event {
                 match d {

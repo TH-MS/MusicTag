@@ -5,7 +5,7 @@ use lofty::config::WriteOptions;
 use lofty::prelude::*;
 use lofty::picture::{Picture, PictureInformation, PictureType};
 use lofty::probe::Probe;
-use lofty::tag::{ItemKey, Tag};
+use lofty::tag::{ItemKey, Tag, TagType};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -57,6 +57,12 @@ pub struct TrackEdit {
     /// After tagging, move the file to `<root>/<parts[0]>/<parts[1]>/.../<last part>.<ext>`.
     pub dest_root: Option<String>,
     pub dest_parts: Option<Vec<String>>,
+    /// A `data:` URL with image bytes to embed as the front cover.
+    #[serde(default)]
+    pub cover_data: Option<String>,
+    /// Strip all embedded pictures.
+    #[serde(default)]
+    pub remove_cover: bool,
 }
 
 #[derive(Serialize, Debug)]
@@ -194,15 +200,47 @@ fn read_picture(path: &Path) -> Result<Option<Picture>, String> {
     Ok(tag.and_then(pick_picture).cloned())
 }
 
+fn mime_of(data: &[u8]) -> Option<lofty::picture::MimeType> {
+    use lofty::picture::MimeType;
+    if data.starts_with(&[0x89, b'P', b'N', b'G']) { Some(MimeType::Png) }
+    else if data.starts_with(&[0xFF, 0xD8]) { Some(MimeType::Jpeg) }
+    else if data.starts_with(b"GIF8") { Some(MimeType::Gif) }
+    else if data.starts_with(b"BM") { Some(MimeType::Bmp) }
+    else { None }
+}
+
+fn picture_from_bytes(data: Vec<u8>) -> Result<Picture, String> {
+    let mime = mime_of(&data).ok_or("unsupported image (use JPEG, PNG, GIF or BMP)")?;
+    Ok(Picture::new_unchecked(PictureType::CoverFront, Some(mime), None, data))
+}
+
+fn picture_from_data_url(url: &str) -> Result<Picture, String> {
+    let b64 = url.split_once(',').map(|x| x.1).ok_or("bad image data")?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).map_err(es)?;
+    picture_from_bytes(bytes)
+}
+
+fn data_url_of(pic: &Picture) -> String {
+    let mime = pic.mime_type().map(|m| m.to_string()).unwrap_or_else(|| "image/jpeg".to_string());
+    format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(pic.data()))
+}
+
+/// An image file chosen by the user → (`data:` URL, size info).
+pub fn image_from_file(path: &str) -> Result<(String, CoverInfo), String> {
+    let pic = picture_from_bytes(std::fs::read(path).map_err(es)?)?;
+    Ok((data_url_of(&pic), cover_info(&pic)))
+}
+
+/// Write the image inside a `data:` URL to a file.
+pub fn write_data_url(dest: &str, url: &str) -> Result<(), String> {
+    let pic = picture_from_data_url(url)?;
+    std::fs::write(dest, pic.data()).map_err(es)
+}
+
 /// Front cover of a file as a `data:` URL (for display).
 pub fn cover_data_url(path: &str) -> Option<String> {
     let pic = read_picture(Path::new(path)).ok()??;
-    let mime = pic
-        .mime_type()
-        .map(|m| m.to_string())
-        .unwrap_or_else(|| "image/jpeg".to_string());
-    let b64 = base64::engine::general_purpose::STANDARD.encode(pic.data());
-    Some(format!("data:{mime};base64,{b64}"))
+    Some(data_url_of(&pic))
 }
 
 fn set_text(tag: &mut Tag, key: ItemKey, value: &str) {
@@ -244,13 +282,29 @@ fn write_track(edit: &TrackEdit, covers: &HashMap<String, Option<Picture>>) -> R
             "disc_total" => set_text(tag, ItemKey::DiscTotal, v),
             "year" => {
                 // ID3v2.4 has no TYER; RecordingDate (TDRC / DATE / ©day) holds year or full date.
-                tag.remove_key(&ItemKey::Year);
+                // One date value only: clear every legacy/duplicate date item first.
+                for k in [ItemKey::Year, ItemKey::RecordingDate, ItemKey::ReleaseDate] {
+                    tag.remove_key(&k);
+                }
                 set_text(tag, ItemKey::RecordingDate, v);
             }
             _ => {}
         }
     }
 
+    if edit.remove_cover {
+        while !tag.pictures().is_empty() {
+            tag.remove_picture(0);
+        }
+    }
+    if let Some(data) = &edit.cover_data {
+        let mut p = picture_from_data_url(data)?;
+        p.set_pic_type(PictureType::CoverFront);
+        while !tag.pictures().is_empty() {
+            tag.remove_picture(0);
+        }
+        tag.push_picture(p);
+    }
     if let Some(src) = &edit.cover_from {
         if let Some(Some(pic)) = covers.get(src) {
             while !tag.pictures().is_empty() {
@@ -262,10 +316,14 @@ fn write_track(edit: &TrackEdit, covers: &HashMap<String, Option<Picture>>) -> R
         }
     }
 
+    // A stale ID3v1 block duplicates (and may contradict) the ID3v2 values: drop it.
+    tagged.remove(TagType::Id3v1);
     // ID3v2.4: v2.3 cannot hold Sort Album (TSOA) or full dates (TDRC), so keep the default.
     tagged
         .save_to_path(path, WriteOptions::default())
-        .map_err(es)
+        .map_err(es)?;
+    TagType::Id3v1.remove_from_path(path).map_err(es)?;
+    Ok(())
 }
 
 /// Make one path component safe on Windows (same spirit as MP3Tag: bad characters become `_`).

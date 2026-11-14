@@ -40,6 +40,8 @@ fn edit(path: &PathBuf, f: &[(&str, &str)], cover_from: Option<&PathBuf>) -> Tra
         cover_from: cover_from.map(|p| p.to_string_lossy().to_string()),
         dest_root: None,
         dest_parts: None,
+        cover_data: None,
+        remove_cover: false,
     }
 }
 
@@ -167,6 +169,88 @@ fn moves_into_artist_album_folders() {
         path: p1.clone(), fields: HashMap::new(), cover_from: None,
         dest_root: Some(root.to_string_lossy().to_string()),
         dest_parts: Some(vec!["AC/DC".into(), "Back in Black?".into(), "1-01 - Song".into()]),
+        cover_data: None,
+        remove_cover: false,
     }]);
     assert_eq!(again[0].track.as_ref().unwrap().path, p1);
+}
+
+fn id3v23(frames: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (id, payload) in frames {
+        body.extend_from_slice(id.as_bytes());
+        body.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        body.extend_from_slice(&[0, 0]);
+        body.extend_from_slice(payload);
+    }
+    let sz = body.len();
+    let mut v = b"ID3".to_vec();
+    v.extend_from_slice(&[3, 0, 0]);
+    v.extend_from_slice(&[((sz >> 21) & 0x7f) as u8, ((sz >> 14) & 0x7f) as u8, ((sz >> 7) & 0x7f) as u8, (sz & 0x7f) as u8]);
+    v.extend(body);
+    v
+}
+fn text(s: &str) -> Vec<u8> {
+    let mut p = vec![0u8];
+    p.extend_from_slice(s.as_bytes());
+    p
+}
+
+/// A file tagged by an older tool: v2.3 year+date frames, an ID3v1 block, a rating and a PRIV frame.
+fn legacy_file(name: &str) -> PathBuf {
+    let p = tmp(name);
+    let mut v = id3v23(&[
+        ("TIT2", text("Old title")),
+        ("TYER", text("1999")),
+        ("TDAT", text("0105")),
+        ("POPM", [b"me@x.org\0".as_slice(), &[200, 0, 0, 0, 3]].concat()),
+        ("PRIV", [b"owner\0".as_slice(), b"secret-data"].concat()),
+    ]);
+    v.extend(silent_mp3());
+    let mut v1 = vec![0u8; 128];
+    v1[..3].copy_from_slice(b"TAG");
+    v1[3..11].copy_from_slice(b"Old v1  ");
+    v.extend(v1);
+    std::fs::write(&p, v).unwrap();
+    p
+}
+
+#[test]
+fn year_is_exact_with_no_legacy_duplicates() {
+    let p = legacy_file("legacy.mp3");
+    let r = save_tracks(vec![edit(&p, &[("year", "1999")], None)]);
+    assert!(r[0].ok, "{:?}", r[0].error);
+    let b = std::fs::read(&p).unwrap();
+    assert!(contains(&b, b"TDRC"), "no TDRC frame");
+    assert!(!contains(&b, b"TYER"), "legacy TYER still present");
+    assert!(!contains(&b, b"TDAT"), "legacy TDAT (day/month) still present");
+    assert_eq!(read_track(&p).unwrap().year, "1999");
+    let tail = &b[b.len() - 128..];
+    assert_ne!(&tail[..3], b"TAG", "ID3v1 block still present");
+}
+
+#[test]
+fn other_frames_survive_a_save() {
+    let p = legacy_file("legacy2.mp3");
+    save_tracks(vec![edit(&p, &[("title", "New")], None)]);
+    let b = std::fs::read(&p).unwrap();
+    assert!(contains(&b, b"POPM"), "rating frame lost");
+    assert!(contains(&b, b"PRIV"), "PRIV frame lost");
+}
+
+#[test]
+fn cover_from_data_url_and_removal() {
+    use base64::Engine;
+    let p = tmp("cd.mp3");
+    std::fs::write(&p, silent_mp3()).unwrap();
+    let url = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(fake_png(640, 640)));
+    let mut e = edit(&p, &[], None);
+    e.cover_data = Some(url);
+    assert!(save_tracks(vec![e])[0].ok);
+    let c = read_track(&p).unwrap().cover.unwrap();
+    assert_eq!((c.width, c.height), (640, 640));
+    let mut e = edit(&p, &[], None);
+    e.remove_cover = true;
+    assert!(save_tracks(vec![e])[0].ok);
+    assert!(read_track(&p).unwrap().cover.is_none());
 }
