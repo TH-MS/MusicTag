@@ -38,6 +38,8 @@ fn edit(path: &PathBuf, f: &[(&str, &str)], cover_from: Option<&PathBuf>) -> Tra
         path: path.to_string_lossy().to_string(),
         fields: f.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<HashMap<_, _>>(),
         cover_from: cover_from.map(|p| p.to_string_lossy().to_string()),
+        dest_root: None,
+        dest_parts: None,
     }
 }
 
@@ -137,4 +139,34 @@ fn folders_are_scanned() {
     std::fs::write(d.join("notes.txt"), b"hi").unwrap();
     let t = load_paths(&[d.to_string_lossy().to_string()]);
     assert_eq!(t.len(), 2);
+}
+
+#[test]
+fn moves_into_artist_album_folders() {
+    let root = tmp("lib");
+    let _ = std::fs::remove_dir_all(&root);
+    let a = tmp("m1.mp3");
+    let b = tmp("m2.mp3");
+    std::fs::write(&a, silent_mp3()).unwrap();
+    std::fs::write(&b, silent_mp3()).unwrap();
+    let mk = |p: &PathBuf| {
+        let mut e = edit(p, &[("title", "Song")], None);
+        e.dest_root = Some(root.to_string_lossy().to_string());
+        e.dest_parts = Some(vec!["AC/DC".into(), "Back in Black?".into(), "1-01 - Song".into()]);
+        e
+    };
+    let r = save_tracks(vec![mk(&a), mk(&b)]);
+    assert!(r.iter().all(|x| x.ok), "{:?}", r.iter().map(|x| &x.error).collect::<Vec<_>>());
+    let p1 = r[0].track.as_ref().unwrap().path.clone();
+    let p2 = r[1].track.as_ref().unwrap().path.clone();
+    assert!(p1.replace('\\', "/").ends_with("AC_DC/Back in Black_/1-01 - Song.mp3"), "{p1}");
+    assert!(p2.ends_with("1-01 - Song (1).mp3"), "{p2}");
+    assert!(!a.exists() && !b.exists());
+    // Saving again is a no-op move.
+    let again = save_tracks(vec![TrackEdit {
+        path: p1.clone(), fields: HashMap::new(), cover_from: None,
+        dest_root: Some(root.to_string_lossy().to_string()),
+        dest_parts: Some(vec!["AC/DC".into(), "Back in Black?".into(), "1-01 - Song".into()]),
+    }]);
+    assert_eq!(again[0].track.as_ref().unwrap().path, p1);
 }

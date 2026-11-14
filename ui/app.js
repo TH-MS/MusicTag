@@ -48,13 +48,30 @@ function saveCols() {
 }
 
 /* ───────────────────────── state ───────────────────────── */
+const PREFS_KEY = 'musictag.prefs.v1';
+function loadPrefs() {
+  const d = { albumSort: { by: 'artist', dir: 1, within: 'year' }, dest: { root: '', move: true } };
+  try {
+    const p = JSON.parse(localStorage.getItem(PREFS_KEY) || 'null');
+    if (p) return { albumSort: { ...d.albumSort, ...p.albumSort }, dest: { ...d.dest, ...p.dest } };
+  } catch (_) { /* ignore */ }
+  return d;
+}
+function savePrefs() {
+  try { localStorage.setItem(PREFS_KEY, JSON.stringify({ albumSort: S.albumSort, dest: S.dest })); } catch (_) { /* ignore */ }
+}
+const prefs0 = loadPrefs();
 const S = {
   tracks: new Map(),          // path -> track
   groups: new Map(),          // album key -> [track]
   cards: new Map(),           // album key -> element
   cols: loadCols(),
-  sort: { id: '_default', dir: 1 },
-  sel: null,
+  sort: { id: '_default', dir: 1 },   // row order inside albums
+  albumSort: prefs0.albumSort,        // order of the albums themselves
+  dest: prefs0.dest,                  // where saved files are filed
+  collapsed: new Set(),
+  sel: new Set(),                     // selected track paths
+  cursor: null,
   armed: false,
 };
 const coverCache = new Map(); // path -> Promise<dataUrl|null>
@@ -125,8 +142,29 @@ function regroup() {
   }
 }
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+function mostCommon(vals) {
+  const c = new Map();
+  vals.forEach(v => c.set(v, (c.get(v) || 0) + 1));
+  return [...c.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? '';
+}
+function cardInfo(list) {
+  const artist = mostCommon(list.map(t => val(t, 'album_artist').trim()).filter(Boolean))
+    || mostCommon(list.map(t => val(t, 'artist').trim()).filter(Boolean));
+  const years = list.map(t => parseInt(val(t, 'year'), 10)).filter(Number.isFinite);
+  return { artist, year: years.length ? Math.min(...years) : 0, secs: list.reduce((a, t) => a + (t.base.duration || 0), 0) };
+}
 function sortedKeys() {
-  return [...S.groups.keys()].sort((a, b) => (a === '' ? 1 : b === '' ? -1 : collator.compare(a, b)));
+  const { by, dir, within } = S.albumSort;
+  const info = new Map([...S.groups].map(([k, l]) => [k, cardInfo(l)]));
+  const title = (a, b) => collator.compare(a, b);
+  const year = (a, b) => (info.get(a).year || 9999) - (info.get(b).year || 9999);
+  const artist = (a, b) => collator.compare(info.get(a).artist, info.get(b).artist);
+  return [...S.groups.keys()].sort((a, b) => {
+    if (a === '' || b === '') return a === '' ? 1 : -1;       // "(No album)" always last
+    if (by === 'title') return title(a, b) * dir;
+    if (by === 'year') return (year(a, b) * dir) || artist(a, b) || title(a, b);
+    return (artist(a, b) * dir) || (within === 'title' ? title(a, b) : year(a, b) || title(a, b));
+  });
 }
 function sortRows(list) {
   const { id, dir } = S.sort;
@@ -162,11 +200,15 @@ function bestCoverTrack(list) {
 function updateCover(card, list) {
   const best = bestCoverTrack(list);
   const srcPath = best ? (best.coverFrom || best.path) : null;
-  const box = $('.cover', card), meta = $('.cover-meta', card);
+  const box = $('.cover', card), thumb = $('.thumb', card), meta = $('.cover-meta', card);
   if (card._cover !== srcPath) {
     card._cover = srcPath;
-    box.replaceChildren(srcPath ? '' : '♪');
-    if (srcPath) coverUrl(srcPath).then(u => { if (card._cover === srcPath) box.replaceChildren(u ? h('img', { src: u, draggable: 'false' }) : '♪'); });
+    box.replaceChildren(srcPath ? '' : '♪'); thumb.replaceChildren();
+    if (srcPath) coverUrl(srcPath).then(u => {
+      if (card._cover !== srcPath) return;
+      box.replaceChildren(u ? h('img', { src: u, draggable: 'false' }) : '♪');
+      if (u) thumb.replaceChildren(h('img', { src: u, draggable: 'false' }));
+    });
   }
   meta.replaceChildren();
   if (!best) { meta.textContent = 'No cover'; return; }
@@ -188,7 +230,7 @@ function applyTemplate() {
 }
 
 function buildCard(key) {
-  const card = h('div', { class: 'card', data: { key } });
+  const card = h('div', { class: 'card' + (S.collapsed.has(key) ? ' collapsed' : ''), data: { key } });
   card._key = key;
   const inputs = FIELDS.map(([f, label]) => {
     const input = h('input', { type: 'text', spellcheck: 'false', data: { f }, on: {
@@ -198,14 +240,23 @@ function buildCard(key) {
     return h('label', {}, label, input);
   });
   card.append(
-    h('div', { class: 'side' },
-      h('div', { class: 'cover' }),
-      h('div', { class: 'cover-meta' }),
-      h('button', { class: 'auto', text: 'Auto', title: 'Fill album artist, unify cover art, tidy track and disc numbers', on: { click: () => autoAlbum(key) } })),
-    h('div', { class: 'body' },
-      h('div', { class: 'fields' }, inputs),
-      h('div', { class: 'tbl' })),
-    h('button', { class: 'close', text: '×', title: 'Remove album from list', on: { click: () => removeAlbum(key) } }),
+    h('div', { class: 'card-head', on: { click: e => { if (!e.target.closest('.close')) toggleCard(key); } } },
+      h('button', { class: 'chev', title: 'Expand / collapse' }),
+      h('div', { class: 'thumb' }),
+      h('div', { class: 'ttl' }), h('div', { class: 'sub' }),
+      h('div', { class: 'spacer' }),
+      h('span', { class: 'badge sel', hidden: '' }), h('span', { class: 'badge edited', hidden: '' }),
+      h('button', { class: 'close', text: '×', title: 'Remove album from list', on: { click: () => removeAlbum(key) } })),
+    h('div', { class: 'main' },
+      h('div', { class: 'side' },
+        h('div', { class: 'cover' }),
+        h('div', { class: 'cover-meta' }),
+        h('button', { class: 'auto', text: 'Auto', title: 'Fill album artist, unify cover art, tidy track/disc numbers and sort album', on: { click: () => autoAlbum(key) } }),
+        h('button', { class: 'selall', text: 'Select All', title: 'Select every track in this album', on: { click: () => selectAll(key) } }),
+        h('button', { class: 'primary savealbum', text: 'Save (0)', title: 'Save just this album', on: { click: () => saveTracks(S.groups.get(key) || []) } })),
+      h('div', { class: 'body' },
+        h('div', { class: 'fields' }, inputs),
+        h('div', { class: 'tbl' }))),
   );
   updateCard(card);
   return card;
@@ -219,12 +270,33 @@ function updateCard(card) {
   tbl.scrollLeft = left;
   syncFields(card);
   updateCover(card, list);
+  updateHead(card);
 }
 
-function syncFields(card) {
+function updateHead(card) {
   const list = S.groups.get(card._key) || [];
+  const info = cardInfo(list), ctx = albumCtx(list);
+  $('.chev', card).textContent = S.collapsed.has(card._key) ? '▸' : '▾';
+  $('.ttl', card).textContent = card._key || '(No album)';
+  $('.sub', card).textContent = [info.artist, info.year || '', `${list.length} track${list.length === 1 ? '' : 's'}`, `${Math.round(info.secs / 60)} min`]
+    .filter(Boolean).join(' · ');
+  const dirty = list.filter(isDirty).length;
+  const ed = $('.badge.edited', card); ed.hidden = !dirty; ed.textContent = `${dirty} edited`;
+  const sub = editSubset(list);
+  const sb = $('.badge.sel', card); sb.hidden = !sub; if (sub) sb.textContent = `editing ${sub.length} selected`;
+  const n = list.filter(t => needsSave(t, ctx)).length;
+  const btn = $('.savealbum', card); btn.textContent = `Save (${n})`; btn.disabled = n === 0;
+}
+
+// Tracks the bulk fields act on: the whole album, unless a partial multi-selection exists.
+function editSubset(list) {
+  const sel = list.filter(t => S.sel.has(t.path));
+  return sel.length > 1 && sel.length < list.length ? sel : null;
+}
+function syncFields(card) {
+  const all = S.groups.get(card._key) || [];
+  const list = editSubset(all) || all;
   for (const input of card.querySelectorAll('.fields input')) {
-    if (document.activeElement === input && input._busy) continue;
     const f = input.dataset.f;
     const vals = new Set(list.map(t => val(t, f)));
     const mixed = vals.size > 1;
@@ -232,6 +304,35 @@ function syncFields(card) {
     input.placeholder = mixed ? '<keep>' : '';
     input.classList.toggle('dirty', list.some(t => f in t.ed));
   }
+}
+
+/* ── filing: Artist \ Album \ [disc-]NN - Title ── */
+const san = s => {
+  const c = [...String(s)].map(ch => (ch.charCodeAt(0) < 32 || '<>:"/\\|?*'.includes(ch)) ? '_' : ch).join('').trim().replace(/[. ]+$/, '');
+  return c || '_';
+};
+function albumCtx(list) {
+  const rows = list.map(t => pair(val(t, 'disc')));
+  const discs = Math.max(1, ...rows.map(r => r.n || 1), ...rows.map(r => r.t || 0));
+  const maxTrack = Math.max(0, ...list.map(t => pair(val(t, 'track')).n || 0));
+  return { multi: discs > 1, tw: Math.max(2, String(maxTrack).length) };
+}
+function targetParts(t, ctx) {
+  const artist = val(t, 'album_artist').trim() || val(t, 'artist').trim() || 'Unknown Artist';
+  const album = keyOf(t) || 'Unknown Album';
+  const tr = pair(val(t, 'track')), ds = pair(val(t, 'disc'));
+  const title = val(t, 'title').trim() || t.base.filename.replace(/\.[^.]+$/, '');
+  const stem = (ctx.multi ? `${ds.n ?? 1}-` : '') + (tr.n != null ? `${padN(tr.n, ctx.tw)} - ` : '') + title;
+  return [san(artist), san(album), san(stem)];
+}
+const normPath = p => p.replace(/\\/g, '/').toLowerCase();
+function needsSave(t, ctx) {
+  if (isDirty(t)) return true;
+  if (!S.dest.move || !S.dest.root) return false;
+  const sep = S.dest.root.includes('\\') ? '\\' : '/';
+  const want = normPath([S.dest.root.replace(/[\\/]+$/, ''), ...targetParts(t, ctx)].join(sep) + '.' + t.base.kind);
+  const have = normPath(t.path).replace(/ \(\d+\)(\.[^./]*)$/, '$1');
+  return want !== have;
 }
 
 function buildHeader() {
@@ -247,7 +348,7 @@ function buildHeader() {
 }
 
 function buildRow(t) {
-  const row = h('div', { class: 'tr row' + (S.sel === t.path ? ' sel' : ''), data: { path: t.path } });
+  const row = h('div', { class: 'tr row' + (S.sel.has(t.path) ? ' sel' : ''), data: { path: t.path } });
   for (const id of visible()) {
     const c = COL[id];
     row.append(h('div', {
@@ -293,22 +394,55 @@ function mutate(list, fn) {
   refresh(new Set([...before, ...list.map(keyOf)]));
 }
 
+function pendingCount() {
+  let n = 0;
+  for (const list of S.groups.values()) { const ctx = albumCtx(list); n += list.filter(t => needsSave(t, ctx)).length; }
+  return n;
+}
 function chrome() {
   const n = S.tracks.size, a = S.groups.size;
   document.body.classList.toggle('is-empty', n === 0);
   $('#stats').textContent = n ? `${n} track${n === 1 ? '' : 's'} · ${a} album${a === 1 ? '' : 's'}` : '';
-  const dirty = [...S.tracks.values()].filter(isDirty).length;
+  S.cards.forEach(updateHead);
+  const pend = pendingCount();
   const save = $('#btn-save');
-  save.disabled = dirty === 0;
-  save.textContent = dirty ? `Save (${dirty})` : 'Save';
+  save.disabled = pend === 0;
+  save.textContent = `Save all (${pend})`;
   const clr = $('#btn-clear');
   clr.hidden = n === 0;
   if (!S.armed) clr.textContent = 'Clear';
+  $('#btn-fold').hidden = n === 0;
+  $('#btn-fold').textContent = [...S.groups.keys()].some(k => !S.collapsed.has(k)) ? 'Collapse all' : 'Expand all';
+}
+
+/* ───────────────────────── collapse / selection ───────────────────────── */
+function toggleCard(key) {
+  if (S.collapsed.has(key)) S.collapsed.delete(key); else S.collapsed.add(key);
+  const card = S.cards.get(key);
+  card.classList.toggle('collapsed', S.collapsed.has(key));
+  chrome();
+}
+function foldAll() {
+  const anyOpen = [...S.groups.keys()].some(k => !S.collapsed.has(k));
+  if (anyOpen) S.groups.forEach((_, k) => S.collapsed.add(k)); else S.collapsed.clear();
+  S.cards.forEach((c, k) => c.classList.toggle('collapsed', S.collapsed.has(k)));
+  chrome();
+}
+function selectionChanged() {
+  albumsEl.querySelectorAll('.row').forEach(r => r.classList.toggle('sel', S.sel.has(r.dataset.path)));
+  S.cards.forEach(syncFields);
+  S.cards.forEach(updateHead);
+}
+function selectAll(key) {
+  S.sel = new Set((S.groups.get(key) || []).map(t => t.path));
+  S.cursor = null;
+  selectionChanged();
 }
 
 /* ───────────────────────── editing ───────────────────────── */
 function bulkSet(card, f, input) {
-  const list = S.groups.get(card._key) || [];
+  const all = S.groups.get(card._key) || [];
+  const list = editSubset(all) || all;
   const v = input.value.trim();
   const mixed = new Set(list.map(t => val(t, f))).size > 1;
   if (v === '' && mixed) return;                       // <keep>
@@ -389,14 +523,17 @@ function autoAlbum(key) {
       setVal(r.t, 'track', `${padN(r.tr.n, w)}/${padN(perDisc.get(r.ds.n ?? 1), w)}`);
     });
 
-    // 4. Disc numbers: 01, 02 … and, when there are several discs, "of" = disc count.
-    const maxDisc = Math.max(0, ...rows.map(r => r.ds.n || 0));
-    const wd = Math.max(2, String(maxDisc).length);
-    rows.forEach(r => {
-      if (r.ds.n == null) return;
-      const total = maxDisc > 1 ? maxDisc : r.ds.t;
-      setVal(r.t, 'disc', total ? `${padN(r.ds.n, wd)}/${padN(total, wd)}` : padN(r.ds.n, wd));
-    });
+    // 4. Disc numbers: 01, 02 … and "of" is ALWAYS filled (01/01 for a single disc). A missing disc counts as disc 1.
+    const dn = r => r.ds.n ?? 1;
+    const discTotal = Math.max(1, ...rows.map(dn), ...rows.map(r => r.ds.t || 0));
+    const wd = Math.max(2, String(discTotal).length);
+    rows.forEach(r => setVal(r.t, 'disc', `${padN(dn(r), wd)}/${padN(discTotal, wd)}`));
+
+    // 5. Sort Album: if empty and every track shares one year, use that year.
+    const years = list.map(t => /^\s*(\d{4})/.exec(val(t, 'year'))?.[1]);
+    if (years.every(Boolean) && new Set(years).size === 1) {
+      list.forEach(t => { if (!val(t, 'sort_album').trim()) setVal(t, 'sort_album', years[0]); });
+    }
   });
   const after = snap();
   const n = list.filter((_, i) => before[i] !== after[i]).length;
@@ -415,17 +552,33 @@ async function addPaths(paths) {
   renderAll();
 }
 
-async function saveAll() {
-  const dirty = [...S.tracks.values()].filter(isDirty);
-  if (!dirty.length) return;
+async function chooseRoot() {
+  try {
+    const d = await TAURI.dialog.open({ directory: true, multiple: false, title: 'Choose the folder to file music into' });
+    if (d) { S.dest.root = Array.isArray(d) ? d[0] : d; savePrefs(); chrome(); return S.dest.root; }
+  } catch (e) { toast(`Could not open dialog: ${e}`); }
+  return '';
+}
+
+// Save the given tracks (only those with something to write or to move).
+async function saveTracks(scope) {
+  if (!scope.length) return;
+  if (S.dest.move && !S.dest.root && !(await chooseRoot())) { toast('Pick a destination folder, or turn off filing in the Folder menu'); return; }
+  const ctxs = new Map();
+  const ctxOf = t => { const k = keyOf(t); if (!ctxs.has(k)) ctxs.set(k, albumCtx(S.groups.get(k) || [])); return ctxs.get(k); };
+  const todo = scope.filter(t => needsSave(t, ctxOf(t)));
+  if (!todo.length) return;
   const btn = $('#btn-save'); btn.disabled = true; btn.textContent = 'Saving…';
   const split = s => { const [a, b = ''] = String(s || '').split('/'); return [a.trim(), b.trim()]; };
-  const edits = dirty.map(t => {
+  const sep = S.dest.root.includes('\\') ? '\\' : '/';
+  const edits = todo.map(t => {
     const [tn, tt] = split(val(t, 'track')), [dn, dt] = split(val(t, 'disc'));
     const fields = { track: tn, track_total: tt, disc: dn, disc_total: dt };
     ['title', 'artist', 'album', 'album_artist', 'genre', 'sort_album', 'comment', 'composer', 'year']
       .forEach(f => { fields[f] = val(t, f); });
-    return { path: t.path, fields, cover_from: t.coverFrom };
+    const move = S.dest.move && S.dest.root;
+    return { path: t.path, fields, cover_from: t.coverFrom,
+      dest_root: move ? S.dest.root : null, dest_parts: move ? targetParts(t, ctxOf(t)) : null };
   });
   let results;
   try { results = await invoke('save_tracks', { edits }); }
@@ -437,9 +590,14 @@ async function saveAll() {
     keys.add(keyOf(t));
     if (r.ok) {
       ok++;
-      coverCache.delete(r.path);
-      if (r.track) { const fresh = mkTrack(r.track); t.base = fresh.base; t.ed = {}; t.coverFrom = null; }
-      else { t.ed = {}; t.coverFrom = null; }
+      S.tracks.delete(r.path); coverCache.delete(r.path);
+      if (r.track) {
+        const fresh = mkTrack(r.track);
+        if (S.sel.delete(r.path)) S.sel.add(fresh.path);
+        t.base = fresh.base; t.path = fresh.path;
+      }
+      t.ed = {}; t.coverFrom = null;
+      S.tracks.set(t.path, t);
       keys.add(keyOf(t));
     } else failed.push(`${t.base.filename}: ${r.error}`);
   }
@@ -447,6 +605,7 @@ async function saveAll() {
   refresh(keys);
   toast(failed.length ? `Saved ${ok}, ${failed.length} failed — ${failed[0]}` : `Saved ${ok} track${ok === 1 ? '' : 's'}`, failed.length ? 7000 : 2500);
 }
+const saveAll = () => saveTracks([...S.tracks.values()]);
 
 function clearAll() {
   const dirty = [...S.tracks.values()].some(isDirty);
@@ -457,7 +616,7 @@ function clearAll() {
     return;
   }
   S.armed = false; btn.classList.remove('armed');
-  S.tracks.clear(); coverCache.clear(); S.sel = null;
+  S.tracks.clear(); coverCache.clear(); S.sel.clear(); S.collapsed.clear();
   renderAll();
 }
 
@@ -478,21 +637,64 @@ function toast(msg, ms = 2800) {
 }
 
 const menu = $('#menu');
-function openMenu(x, y) {
-  menu.replaceChildren(...[...COLS].sort((a, b) => a.label.localeCompare(b.label)).map(c => {
-    const on = !S.cols.hidden.includes(c.id);
-    return h('div', { on: { click: () => {
-      if (on && visible().length === 1) return;
-      S.cols.hidden = on ? [...S.cols.hidden, c.id] : S.cols.hidden.filter(i => i !== c.id);
-      saveCols(); closeMenu(); renderAll();
-    } } }, h('span', { class: 'tick', text: on ? '✓' : '' }), c.label);
+// items: {label, tick, off, hd, rule, fn}
+function showMenu(items, x, y) {
+  menu.replaceChildren(...items.map(it => {
+    if (it.rule) return h('div', { class: 'rule' });
+    return h('div', { class: it.hd ? 'hd' : it.off ? 'off' : '', on: it.fn ? { click: () => { closeMenu(); it.fn(); } } : {} },
+      h('span', { class: 'tick', text: it.tick ? '✓' : '' }), it.label);
   }));
   menu.hidden = false;
   const r = menu.getBoundingClientRect();
-  menu.style.left = `${Math.min(x, innerWidth - r.width - 8)}px`;
+  menu.style.left = `${Math.max(4, Math.min(x, innerWidth - r.width - 8))}px`;
   menu.style.top = `${Math.min(y, innerHeight - r.height - 8)}px`;
 }
 function closeMenu() { menu.hidden = true; }
+function menuAt(btn) { const r = btn.getBoundingClientRect(); return [r.left, r.bottom + 4]; }
+
+function columnMenu(x, y) {
+  showMenu([...COLS].sort((a, b) => a.label.localeCompare(b.label)).map(c => {
+    const on = !S.cols.hidden.includes(c.id);
+    return { label: c.label, tick: on, fn: () => {
+      if (on && visible().length === 1) return;
+      S.cols.hidden = on ? [...S.cols.hidden, c.id] : S.cols.hidden.filter(i => i !== c.id);
+      saveCols(); renderAll();
+    } };
+  }), x, y);
+}
+
+function sortMenu() {
+  const a = S.albumSort;
+  const set = patch => () => { Object.assign(S.albumSort, patch); savePrefs(); renderAll(); };
+  const label = { artist: 'Artist', title: 'Title', year: 'Year' }[a.by];
+  $('#btn-sort').textContent = `Sort: ${label} ${a.dir > 0 ? '↑' : '↓'} ▾`;
+  showMenu([
+    { label: 'By Title', tick: a.by === 'title', fn: set({ by: 'title' }) },
+    { label: 'By Artist', tick: a.by === 'artist', fn: set({ by: 'artist' }) },
+    { label: 'By Year', tick: a.by === 'year', fn: set({ by: 'year' }) },
+    { rule: true },
+    { label: 'Ascending', tick: a.dir > 0, fn: set({ dir: 1 }) },
+    { label: 'Descending', tick: a.dir < 0, fn: set({ dir: -1 }) },
+    { rule: true },
+    { label: 'Within artists', hd: true },
+    { label: 'By Title', tick: a.within === 'title', off: a.by !== 'artist', fn: set({ within: 'title' }) },
+    { label: 'By Year', tick: a.within === 'year', off: a.by !== 'artist', fn: set({ within: 'year' }) },
+  ], ...menuAt($('#btn-sort')));
+}
+function syncSortLabel() {
+  const a = S.albumSort;
+  $('#btn-sort').textContent = `Sort: ${{ artist: 'Artist', title: 'Title', year: 'Year' }[a.by]} ${a.dir > 0 ? '↑' : '↓'} ▾`;
+}
+
+function destMenu() {
+  showMenu([
+    { label: S.dest.root ? S.dest.root : 'No folder chosen yet', off: true },
+    { label: 'Choose folder…', fn: async () => { await chooseRoot(); } },
+    { rule: true },
+    { label: 'File into Artist \\ Album \\ 01 - Title on save', tick: S.dest.move, fn: () => { S.dest.move = !S.dest.move; savePrefs(); chrome(); } },
+    { label: 'Multi-disc albums: 1-01 - Title', off: true },
+  ], ...menuAt($('#btn-dest')));
+}
 
 /* ───────────────────────── header interactions ───────────────────────── */
 function autosize(id) {
@@ -554,17 +756,22 @@ albumsEl.addEventListener('dblclick', e => {
 });
 albumsEl.addEventListener('click', e => {
   const row = e.target.closest('.row');
-  if (!row) return;
-  S.sel = row.dataset.path;
-  albumsEl.querySelectorAll('.row.sel').forEach(r => r.classList.remove('sel'));
-  row.classList.add('sel');
+  if (!row || e.target.closest('input')) return;
+  const path = row.dataset.path;
+  if (e.ctrlKey || e.metaKey) { if (!S.sel.delete(path)) S.sel.add(path); S.cursor = path; }
+  else if (e.shiftKey && S.cursor) {
+    const rows = [...row.parentElement.querySelectorAll('.row')].map(r => r.dataset.path);
+    const a = rows.indexOf(S.cursor), b = rows.indexOf(path);
+    if (a >= 0) { S.sel = new Set(rows.slice(Math.min(a, b), Math.max(a, b) + 1)); } else { S.sel = new Set([path]); S.cursor = path; }
+  } else { S.sel = new Set([path]); S.cursor = path; }
+  selectionChanged();
 });
 albumsEl.addEventListener('contextmenu', e => {
-  if (e.target.closest('.th')) { e.preventDefault(); openMenu(e.clientX, e.clientY); }
+  if (e.target.closest('.th')) { e.preventDefault(); columnMenu(e.clientX, e.clientY); }
 });
 addEventListener('mousedown', e => { if (!menu.hidden && !menu.contains(e.target)) closeMenu(); });
 addEventListener('keydown', e => {
-  if (e.key === 'Escape') closeMenu();
+  if (e.key === 'Escape') { closeMenu(); if (!e.target.closest?.('input') && S.sel.size) { S.sel.clear(); selectionChanged(); } }
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') { e.preventDefault(); saveAll(); }
 });
 addEventListener('contextmenu', e => { if (!e.target.closest('.th') && !e.target.closest('input')) e.preventDefault(); });
@@ -573,6 +780,10 @@ addEventListener('contextmenu', e => { if (!e.target.closest('.th') && !e.target
 $('#btn-add').addEventListener('click', browse);
 $('#btn-clear').addEventListener('click', clearAll);
 $('#btn-save').addEventListener('click', saveAll);
+$('#btn-fold').addEventListener('click', foldAll);
+$('#btn-sort').addEventListener('click', e => { e.stopPropagation(); sortMenu(); });
+$('#btn-dest').addEventListener('click', e => { e.stopPropagation(); destMenu(); });
+syncSortLabel();
 $('.drop-target').addEventListener('click', browse);
 
 if (TAURI) {

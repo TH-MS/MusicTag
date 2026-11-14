@@ -54,6 +54,9 @@ pub struct TrackEdit {
     pub fields: HashMap<String, String>,
     /// Copy the front cover of this file into the edited file.
     pub cover_from: Option<String>,
+    /// After tagging, move the file to `<root>/<parts[0]>/<parts[1]>/.../<last part>.<ext>`.
+    pub dest_root: Option<String>,
+    pub dest_parts: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Debug)]
@@ -265,8 +268,57 @@ fn write_track(edit: &TrackEdit, covers: &HashMap<String, Option<Picture>>) -> R
         .map_err(es)
 }
 
+/// Make one path component safe on Windows (same spirit as MP3Tag: bad characters become `_`).
+pub fn sanitize(part: &str) -> String {
+    let cleaned: String = part
+        .chars()
+        .map(|c| if c.is_control() || "<>:\"/\\|?*".contains(c) { '_' } else { c })
+        .collect();
+    let cleaned = cleaned.trim().trim_end_matches(['.', ' ']).to_string();
+    if cleaned.is_empty() { "_".to_string() } else { cleaned }
+}
+
+fn norm(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/").to_lowercase()
+}
+
+/// Move `from` to its destination; returns the final path. Never overwrites another file.
+fn move_file(from: &Path, root: &str, parts: &[String]) -> Result<PathBuf, String> {
+    if parts.is_empty() {
+        return Ok(from.to_path_buf());
+    }
+    let ext = from.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let mut dir = PathBuf::from(root);
+    for p in &parts[..parts.len() - 1] {
+        dir.push(sanitize(p));
+    }
+    let stem = sanitize(&parts[parts.len() - 1]);
+    let name = |n: u32| {
+        let suffix = if n == 0 { String::new() } else { format!(" ({n})") };
+        if ext.is_empty() { format!("{stem}{suffix}") } else { format!("{stem}{suffix}.{ext}") }
+    };
+    std::fs::create_dir_all(&dir).map_err(es)?;
+    let mut n = 0;
+    let target = loop {
+        let t = dir.join(name(n));
+        if norm(&t) == norm(from) {
+            return Ok(from.to_path_buf()); // already in place
+        }
+        if !t.exists() {
+            break t;
+        }
+        n += 1;
+    };
+    if std::fs::rename(from, &target).is_err() {
+        // e.g. different drive: copy then remove
+        std::fs::copy(from, &target).map_err(es)?;
+        std::fs::remove_file(from).map_err(es)?;
+    }
+    Ok(target)
+}
+
 pub fn save_tracks(edits: Vec<TrackEdit>) -> Vec<SaveResult> {
-    // Load every distinct cover source once, up-front.
+    // Load every distinct cover source once, up-front (before any file is touched).
     let mut covers: HashMap<String, Option<Picture>> = HashMap::new();
     for e in &edits {
         if let Some(src) = &e.cover_from {
@@ -275,14 +327,27 @@ pub fn save_tracks(edits: Vec<TrackEdit>) -> Vec<SaveResult> {
                 .or_insert_with(|| read_picture(Path::new(src)).ok().flatten());
         }
     }
+    // Tags are written in parallel; moves afterwards, one at a time, so name clashes resolve cleanly.
+    let written: Vec<Result<(), String>> = edits.par_iter().map(|e| write_track(e, &covers)).collect();
     edits
-        .par_iter()
-        .map(|e| match write_track(e, &covers) {
-            Ok(()) => match read_track(Path::new(&e.path)) {
+        .iter()
+        .zip(written)
+        .map(|(e, w)| {
+            let fail = |err: String| SaveResult { path: e.path.clone(), ok: false, error: Some(err), track: None };
+            if let Err(err) = w {
+                return fail(err);
+            }
+            let mut final_path = PathBuf::from(&e.path);
+            if let (Some(root), Some(parts)) = (&e.dest_root, &e.dest_parts) {
+                match move_file(&final_path, root, parts) {
+                    Ok(p) => final_path = p,
+                    Err(err) => return fail(format!("tags saved, but could not move file: {err}")),
+                }
+            }
+            match read_track(&final_path) {
                 Ok(t) => SaveResult { path: e.path.clone(), ok: true, error: None, track: Some(t) },
                 Err(err) => SaveResult { path: e.path.clone(), ok: true, error: Some(err), track: None },
-            },
-            Err(err) => SaveResult { path: e.path.clone(), ok: false, error: Some(err), track: None },
+            }
         })
         .collect()
 }
